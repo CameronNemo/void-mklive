@@ -143,7 +143,7 @@ fi
 
 # Be absolutely certain the platform is supported before continuing
 case "$PLATFORM" in
-    bananapi|beaglebone|cubieboard2|cubietruck|odroid-c2|odroid-u2|rpi|rpi2|rpi3|GCP|pinebookpro|pinephone|*-musl);;
+    bananapi|beaglebone|cubieboard2|cubietruck|odroid-c2|odroid-u2|rpi|rpi2|rpi3|GCP|pinebookpro|pinephone|rock64|*-musl);;
     *) die "The $PLATFORM is not supported, exiting..."
 esac
 
@@ -165,17 +165,6 @@ if [ "$BOOT_FSTYPE" = "vfat" ]; then
     _args="-I -F16"
 fi
 
-BOOT_START=2048
-ROOT_START=
-case "$PLATFORM" in
-    pinebookpro*)
-        BOOT_START=32768
-        # Without this, sfdisk creates root partition starting at
-        # 2048, overlapping u-boot reserved space and boot partition.
-        ROOT_START=$BOOT_START
-        ;;
-esac
-
 case "$PLATFORM" in
     cubieboard2|cubietruck|ci20*|odroid-c2*)
         # These platforms use a single partition for the entire filesystem.
@@ -193,11 +182,26 @@ _EOF
         # partition (64M by default) and the rest of the space as the
         # root filesystem.  This is the generally preferred disk
         # layout for new platforms.
-        sfdisk "${FILENAME}" <<_EOF
-label: dos
-${BOOT_START},${BOOT_FSSIZE},b,*
-${ROOT_START},+,L
+        case "$PLATFORM" in
+            pinebookpro*|rock64*)
+                # Rockchip SBCs can use GPT and need more space reserved
+                sfdisk "$FILENAME" <<_EOF
+label: gpt
+unit: sectors
+first-lba: 32768
+name=BootFS, size=${BOOT_FSSIZE}, type=L, bootable
+name=RootFS,                      type=L
 _EOF
+                ;;
+            *)
+                # The rest use MBR and need less space reserved
+                sfdisk "${FILENAME}" <<_EOF
+label: dos
+2048,${BOOT_FSSIZE},b,*
+,+,L
+_EOF
+                ;;
+        esac
         LOOPDEV=$(losetup --show --find --partscan "$FILENAME")
         # Normally we need to quote to prevent argument splitting, but
         # we explicitly want argument splitting here.
@@ -291,9 +295,32 @@ ci20*)
     dd if="${ROOTFS}/boot/u-boot-spl.bin" of="${LOOPDEV}" obs=512 seek=1 >/dev/null 2>&1
     dd if="${ROOTFS}/boot/u-boot.img" of="${LOOPDEV}" obs=1K seek=14 >/dev/null 2>&1
     ;;
+rock64*)
+    rockchip_flash_uboot "${ROOTFS}/usr/lib/rock64-uboot" "$LOOPDEV"
+    # populate the extlinux.conf file
+    cat >"${ROOTFS}/etc/default/extlinux" <<_EOF
+TIMEOUT=3
+# Defaults to current kernel cmdline if left empty
+CMDLINE="panic=10 coherent_pool=1M console=ttyS2,1500000 root=UUID=${ROOT_UUID} rw"
+# set this to use a DEVICETREEDIR line in place of an FDT line
+USE_DEVICETREEDIR="yes"
+# relative dtb path supplied to FDT line, as long as above is unset
+DTBPATH=""
+_EOF
+    mkdir -p "${ROOTFS}/boot/extlinux"
+    run_cmd_chroot "${ROOTFS}" "/etc/kernel.d/post-install/60-extlinux"
+    # configure and enable services
+    cat >"${ROOTFS}/etc/sv/agetty-console/conf" <<_EOF
+BAUD_RATE=1500000
+TERM_NAME=linux
+_EOF
+    for _service in dhcpcd sshd agetty-console ; do
+        run_cmd_chroot "${ROOTFS}" "ln -sv /etc/sv/$_service /etc/runit/runsvdir/default/$_service"
+    done
+    cleanup_chroot
+    ;;
 pinebookpro*)
-    dd if="${ROOTFS}/usr/lib/pinebookpro-uboot/idbloader.img" of="${LOOPDEV}" seek=64 conv=notrunc,fsync >/dev/null 2>&1
-    dd if="${ROOTFS}/usr/lib/pinebookpro-uboot/u-boot.itb" of="${LOOPDEV}" seek=16384 conv=notrunc,fsync >/dev/null 2>&1
+    rockchip_flash_uboot "${ROOTFS}/boot" "$LOOPDEV"
     run_cmd_chroot "${ROOTFS}" "xbps-reconfigure -f pinebookpro-kernel"
     cleanup_chroot
     ;;
